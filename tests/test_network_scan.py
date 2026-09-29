@@ -30,6 +30,7 @@ def raw(
     filter_interface=False,
     media_connected=True,
     endpoint_interface=False,
+    description="",
 ):
     return RawAdapterAddress(
         interface_index=index,
@@ -40,6 +41,7 @@ def raw(
         if_type=if_type,
         oper_status=oper_status,
         hardware_interface=hardware,
+        adapter_description=description,
         filter_interface=filter_interface,
         media_connected=media_connected,
         endpoint_interface=endpoint_interface,
@@ -276,6 +278,199 @@ class WindowsAdapterProviderTests(unittest.TestCase):
             [(str(item.network), item.interface_name) for item in networks],
             [("192.168.5.0/24", "以太网")],
         )
+
+
+HYPERV_DESC = "Hyper-V Virtual Ethernet Adapter"
+
+
+class HyperVSwitchAdapterTests(unittest.TestCase):
+    """Hyper-V 外部虚拟交换机：IP 被搬到 vEthernet 上，物理网卡反而没有地址。
+
+    所以"非物理网卡"这条过滤会把唯一可用的网卡干掉 —— 一个物理网卡都选不出来时
+    必须回退使用 Hyper-V 虚拟交换机网卡。
+    """
+
+    def test_physical_adapter_wins_when_both_are_present(self):
+        records = [
+            raw("192.168.5.10", index=1, name="以太网"),
+            raw("192.168.1.5", index=2, name="vEthernet (External)", hardware=False,
+                endpoint_interface=True, description=HYPERV_DESC),
+        ]
+
+        networks = select_scan_networks(records)
+
+        self.assertEqual(
+            [(str(item.network), item.interface_name) for item in networks],
+            [("192.168.5.0/24", "以太网")],
+        )
+
+    def test_falls_back_to_hyperv_switch_when_no_physical_adapter(self):
+        records = [
+            raw("192.168.1.5", index=2, name="vEthernet (External)", hardware=False,
+                endpoint_interface=True, description=HYPERV_DESC),
+        ]
+
+        networks = select_scan_networks(records)
+
+        self.assertEqual(
+            [(str(item.network), item.interface_name) for item in networks],
+            [("192.168.1.0/24", "vEthernet (External)")],
+        )
+
+    def test_fallback_also_matches_by_friendly_name(self):
+        records = [
+            raw("192.168.1.5", index=2, name="vEthernet (External)",
+                hardware=False, endpoint_interface=True),
+        ]
+        self.assertEqual(len(select_scan_networks(records)), 1)
+
+    def test_fallback_keeps_the_local_24_clamp_for_nat_switches(self):
+        # Default Switch / WSL 的 NAT 网段是 /20，回退时必须仍然被截成 /24，
+        # 否则一次扫描就会被这个网段吃满
+        records = [raw("172.20.16.1", prefix=20, index=3, name="vEthernet (Default Switch)",
+                       hardware=False, endpoint_interface=True, description=HYPERV_DESC)]
+        networks = select_scan_networks(records)
+        self.assertEqual([str(item.network) for item in networks], ["172.20.16.0/24"])
+
+    def test_fallback_still_refuses_non_private_addresses(self):
+        # 自动回退不是用户显式指定，不能因此去扫公网网段
+        records = [raw("203.0.113.7", index=4, name="vEthernet (X)", hardware=False,
+                       endpoint_interface=True, description=HYPERV_DESC)]
+        self.assertEqual(select_scan_networks(records), [])
+
+    def test_any_virtual_adapter_is_used_as_fallback_when_no_physical_one(self):
+        """回退不依赖网卡名字：别的虚拟网卡在没有物理网卡时同样是唯一可用的那张。"""
+        records = [raw("10.0.0.2", index=5, name="VMware Network Adapter VMnet8",
+                       hardware=False, description="VMware Virtual Ethernet Adapter")]
+        networks = select_scan_networks(records)
+        self.assertEqual(
+            [(str(item.network), item.interface_name) for item in networks],
+            [("10.0.0.0/24", "VMware Network Adapter VMnet8")],
+        )
+
+    def test_fallback_does_not_include_tunnel_adapters(self):
+        # 隧道网卡（if_type 不为以太网/WiFi）即使没有物理网卡也不扫
+        records = [raw("10.0.0.2", index=6, name="Wintun", if_type=131, hardware=False)]
+        self.assertEqual(select_scan_networks(records), [])
+
+    def test_fallback_log_mentions_how_many_are_hyperv(self):
+        messages = []
+        records = [raw("192.168.1.5", index=7, name="vEthernet (External)", hardware=False,
+                       endpoint_interface=True, description=HYPERV_DESC)]
+        select_scan_networks(records, log=messages.append)
+        self.assertTrue(
+            any("回退使用 1 块虚拟网卡" in message and "Hyper-V 交换机 1 块" in message
+                for message in messages),
+            messages,
+        )
+
+
+class ScanForceRuleTests(unittest.TestCase):
+    """设置里的两个强制规则：按网卡、按网段。"""
+
+    def _both(self):
+        return [
+            raw("192.168.5.10", index=1, name="以太网"),
+            raw("10.0.0.2", index=2, name="Wintun", hardware=False, metric=1),
+        ]
+
+    def test_force_by_device_name_substring(self):
+        networks = select_scan_networks(self._both(), force_devices=["wintun"])
+        self.assertEqual(sorted(item.interface_name for item in networks), ["Wintun", "以太网"])
+
+    def test_force_by_interface_index(self):
+        networks = select_scan_networks(self._both(), force_devices=["2"])
+        self.assertEqual(sorted(item.interface_name for item in networks), ["Wintun", "以太网"])
+
+    def test_force_by_subnet(self):
+        networks = select_scan_networks(self._both(), force_subnets=["10.0.0.0/24"])
+        self.assertEqual(sorted(item.interface_name for item in networks), ["Wintun", "以太网"])
+
+    def test_force_by_subnet_accepts_a_host_address(self):
+        networks = select_scan_networks(self._both(), force_subnets=["10.0.0.2/24"])
+        self.assertEqual(sorted(item.interface_name for item in networks), ["Wintun", "以太网"])
+
+    def test_forced_adapter_may_use_a_non_private_address(self):
+        records = [raw("203.0.113.7", index=2, name="Wintun", hardware=False)]
+        self.assertEqual(len(select_scan_networks(records, force_devices=["wintun"])), 1)
+
+    def test_force_does_not_bypass_a_disconnected_adapter(self):
+        records = [raw("10.0.0.2", name="Wintun", hardware=False, media_connected=False)]
+        self.assertEqual(select_scan_networks(records, force_devices=["wintun"]), [])
+
+    def test_unparsable_force_subnet_is_ignored_with_a_log(self):
+        messages = []
+        # 用隧道网卡：它连回退都不会被选上（if_type 不是以太网/WiFi），
+        # 这样这条用例只验证"坏 CIDR 被忽略"
+        records = [raw("10.0.0.2", index=6, name="Wintun", if_type=131, hardware=False)]
+        networks = select_scan_networks(records, log=messages.append,
+                                        force_subnets=["不是网段", ""])
+        self.assertEqual(networks, [])
+        self.assertTrue(any("无法解析" in message for message in messages), messages)
+
+    def test_force_rules_reach_the_scan_through_get_windows_scan_networks(self):
+        records = [
+            raw("192.168.5.10", index=1, name="以太网"),
+            raw("192.168.9.2", index=2, name="vEthernet (External)", hardware=False,
+                endpoint_interface=True, description=HYPERV_DESC),
+        ]
+        networks = get_windows_scan_networks(
+            adapter_provider=lambda: records,
+            force_devices=["vEthernet (External)"],
+        )
+        self.assertEqual(
+            [item.interface_name for item in networks], ["以太网", "vEthernet (External)"]
+        )
+
+
+class ScanBlockRuleTests(unittest.TestCase):
+    """「扫描设置」里取消勾选 = 一律不扫描，优先于强制规则和自动回退。"""
+
+    def test_blocked_adapter_is_not_scanned(self):
+        records = [raw("192.168.5.10", index=1, name="以太网")]
+        self.assertEqual(select_scan_networks(records, block_devices=["以太网"]), [])
+
+    def test_blocked_physical_adapter_disables_the_automatic_fallback(self):
+        """取消勾选是用户显式表态：不能被自动回退绕过去扫虚拟网卡。"""
+        records = [
+            raw("192.168.5.10", index=1, name="以太网"),
+            raw("192.168.56.1", index=9, name="VMware Network Adapter VMnet1", hardware=False),
+        ]
+        self.assertEqual(select_scan_networks(records, block_devices=["以太网"]), [])
+
+    def test_blocked_virtual_adapter_is_not_used_by_fallback(self):
+        records = [raw("192.168.1.5", index=7, name="vEthernet (External)", hardware=False,
+                       endpoint_interface=True, description=HYPERV_DESC)]
+        self.assertEqual(select_scan_networks(records, block_devices=["vEthernet"]), [])
+
+    def test_block_wins_over_force(self):
+        records = [raw("192.168.5.10", index=1, name="以太网")]
+        networks = select_scan_networks(records, force_devices=["以太网"],
+                                        block_devices=["以太网"])
+        self.assertEqual(networks, [])
+
+    def test_blocking_one_adapter_keeps_the_others(self):
+        records = [
+            raw("192.168.5.10", index=1, name="以太网"),
+            raw("10.0.0.2", index=2, name="USB 网卡"),
+        ]
+        networks = select_scan_networks(records, block_devices=["以太网"])
+        self.assertEqual([item.interface_name for item in networks], ["USB 网卡"])
+
+    def test_blocked_adapter_is_not_a_scan_candidate(self):
+        record = raw("192.168.5.10", index=1, name="以太网")
+        self.assertFalse(network_scan.is_scan_adapter(record, block_devices=["以太网"]))
+        self.assertTrue(network_scan.is_scan_adapter(record))
+
+    def test_block_rules_reach_the_scan_through_get_windows_scan_networks(self):
+        records = [
+            raw("192.168.5.10", index=1, name="以太网"),
+            raw("10.0.0.2", index=2, name="USB 网卡"),
+        ]
+        networks = get_windows_scan_networks(
+            adapter_provider=lambda: records, block_devices=["以太网"]
+        )
+        self.assertEqual([item.interface_name for item in networks], ["USB 网卡"])
 
 
 if __name__ == "__main__":

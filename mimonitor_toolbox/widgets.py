@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -72,6 +73,7 @@ from qfluentwidgets import (
 )
 from qfluentwidgets.common import getFont
 
+from .network_scan import adapter_matches_device_rule, select_scan_networks
 from .windows import user32
 
 
@@ -1654,3 +1656,143 @@ class AddTaskCard(QWidget):
         if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
             self.clicked.emit()
         super().mouseReleaseEvent(event)
+
+
+class ScanSettingsDialog(MessageBoxBase):
+    """扫描设置：**勾选的网卡参与扫描，取消勾选的一律不扫描**。
+
+    打开时按"当前实际会不会扫它"预勾选，所以物理网卡默认是勾上的；保存时再把勾选
+    状态反推成两个名单：
+
+    * 勾上但默认不会扫的（虚拟网卡）-> ``scan_force_devices``
+    * 取消勾选但默认会扫的（物理网卡）-> ``scan_block_devices``
+
+    另外，只要用户对当前这些网卡显式表过态，扫描就不再自动回退用虚拟网卡 ——
+    否则"取消勾选"会被回退绕过（见 ``select_scan_networks``）。
+    网段仍然手输。
+    """
+
+    def __init__(self, records, settings, parent=None):
+        super().__init__(parent)
+        self._rows = []
+        records = list(records or ())
+        self._initial_force = [str(item) for item in (settings.get("scan_force_devices") or [])]
+        self._initial_block = [str(item) for item in (settings.get("scan_block_devices") or [])]
+        subnets_now = [str(item) for item in (settings.get("scan_force_subnets") or [])]
+
+        # 打开时的勾选状态 = 现在实际会不会扫它；_base = 没有任何规则时的默认集合
+        current = self._participating(records, self._initial_force, self._initial_block)
+        self._base = self._participating(records, (), ())
+
+        self.titleLabel = SubtitleLabel("扫描设置", self)
+        self.viewLayout.addWidget(self.titleLabel)
+
+        hint = CaptionLabel(
+            "勾选的网卡参与扫描，取消勾选的一律不扫描。创建 Hyper-V 外部虚拟交换机后，"
+            "IP 会跑到 vEthernet 上、物理网卡没有地址，程序会自动回退使用 vEthernet；"
+            "自动没覆盖到时，在这里勾上它即可。",
+            self,
+        )
+        hint.setWordWrap(True)
+        self.viewLayout.addWidget(hint)
+
+        self._box = QWidget(self)
+        box_layout = QVBoxLayout(self._box)
+        box_layout.setContentsMargins(0, 0, 0, 0)
+        box_layout.setSpacing(6)
+        for record in records:
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            checkbox = CheckBox(
+                f"{record.interface_name} · {record.local_ip}/{record.prefix_length}",
+                self._box,
+            )
+            checkbox.setChecked(record.interface_index in current)
+            checkbox.setToolTip(str(getattr(record, "adapter_description", "") or "未知型号"))
+            state = CaptionLabel(self._state_text(checkbox.isChecked()), self._box)
+            state.setTextColor(QColor(120, 120, 120), QColor(255, 255, 255, 140))
+            checkbox.stateChanged.connect(
+                lambda _state, box=checkbox, label=state: label.setText(
+                    self._state_text(box.isChecked())
+                )
+            )
+            row.addWidget(checkbox)
+            row.addWidget(state)
+            row.addStretch(1)
+            box_layout.addLayout(row)
+            self._rows.append((record, checkbox, state))
+        if not self._rows:
+            box_layout.addWidget(CaptionLabel("没有枚举到带 IPv4 地址的网卡", self._box))
+        box_layout.addStretch(1)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(self._box)
+        scroll.setFixedHeight(min(240, 40 * max(1, len(self._rows)) + 12))
+        self.viewLayout.addWidget(scroll)
+
+        subnet_row = QHBoxLayout()
+        subnet_row.setSpacing(10)
+        subnet_row.addWidget(BodyLabel("强制扫描网段:", self))
+        self.subnetEdit = LineEdit(self)
+        self.subnetEdit.setPlaceholderText("例如 192.168.1.0/24，逗号分隔")
+        self.subnetEdit.setText(", ".join(subnets_now))
+        subnet_row.addWidget(self.subnetEdit, 1)
+        self.viewLayout.addLayout(subnet_row)
+
+        self.widget.setMinimumWidth(520)
+        self.yesButton.setText("保存")
+        self.cancelButton.setText("取消")
+
+    @staticmethod
+    def _state_text(checked):
+        return "将参与扫描" if checked else "不会扫描"
+
+    @staticmethod
+    def _participating(records, force_devices, block_devices):
+        try:
+            return {
+                item.interface_index
+                for item in select_scan_networks(
+                    records,
+                    force_devices=force_devices,
+                    block_devices=block_devices,
+                )
+            }
+        except Exception:
+            return set()
+
+    @staticmethod
+    def split_rule_text(text):
+        """逗号分隔（中英文逗号都认）→ 去空去重的列表。"""
+        values = []
+        for part in str(text or "").replace("，", ",").split(","):
+            value = part.strip()
+            if value and value not in values:
+                values.append(value)
+        return values
+
+    def force_devices(self):
+        """勾上、但默认不会扫的网卡（虚拟网卡）。"""
+        if not self._rows:
+            return list(self._initial_force)      # 一台都没枚举到：别把已有规则清空
+        return [
+            record.interface_name
+            for record, checkbox, _state in self._rows
+            if checkbox.isChecked() and record.interface_index not in self._base
+        ]
+
+    def block_devices(self):
+        """取消勾选、但默认会扫的网卡（物理网卡）。"""
+        if not self._rows:
+            return list(self._initial_block)
+        return [
+            record.interface_name
+            for record, checkbox, _state in self._rows
+            if not checkbox.isChecked() and record.interface_index in self._base
+        ]
+
+    def force_subnets(self):
+        """手输的强制网段（原始文本，解析留给扫描侧，坏值只记日志）。"""
+        return self.split_rule_text(self.subnetEdit.text())

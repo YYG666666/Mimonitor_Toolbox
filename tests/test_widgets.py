@@ -427,6 +427,127 @@ class OsdHudTests(unittest.TestCase):
         self.assertFalse(hud.countdown_bar.isVisibleTo(hud))
 
 
+class ScanSettingsDialogTests(unittest.TestCase):
+    """扫描设置弹窗：勾 = 参与扫描，取消勾选 = 不扫描；网段仍手输。"""
+
+    @staticmethod
+    def _record(ip, name, *, index, prefix=24, hardware=True, endpoint=False, description=""):
+        import ipaddress
+
+        from mimonitor_toolbox.network_scan import RawAdapterAddress
+
+        return RawAdapterAddress(
+            interface_index=index,
+            interface_name=name,
+            local_ip=ipaddress.IPv4Address(ip),
+            prefix_length=prefix,
+            metric=25,
+            if_type=6,
+            oper_status=1,
+            hardware_interface=hardware,
+            adapter_description=description,
+            endpoint_interface=endpoint,
+        )
+
+    def _records(self):
+        return [
+            self._record("192.168.5.10", "以太网", index=1),
+            self._record("192.168.1.5", "vEthernet (External)", index=7, hardware=False,
+                         endpoint=True, description="Hyper-V Virtual Ethernet Adapter"),
+            self._record("192.168.56.1", "VMware Network Adapter VMnet1", index=9,
+                         hardware=False, description="VMware Virtual Ethernet Adapter"),
+        ]
+
+    def _dialog(self, records, settings):
+        from PyQt6.QtWidgets import QWidget
+
+        from mimonitor_toolbox.widgets import ScanSettingsDialog
+
+        # MessageBoxBase 必须有 parent（要用它的尺寸铺遮罩）
+        parent = QWidget()
+        dialog = ScanSettingsDialog(records, settings, parent)
+        self.addCleanup(dialog.deleteLater)
+        self.addCleanup(parent.deleteLater)
+        return dialog
+
+    def _checked(self, dialog):
+        return {record.interface_name: box.isChecked() for record, box, _state in dialog._rows}
+
+    def test_prechecks_what_is_currently_scanned(self):
+        dialog = self._dialog(self._records(), {})
+
+        # 物理网卡默认就扫 -> 勾上；虚拟网卡被跳过 -> 不勾
+        self.assertEqual(
+            self._checked(dialog),
+            {"以太网": True, "vEthernet (External)": False,
+             "VMware Network Adapter VMnet1": False},
+        )
+        self.assertEqual(
+            [state.text() for _r, _b, state in dialog._rows],
+            ["将参与扫描", "不会扫描", "不会扫描"],
+        )
+        # 原样保存不该产生任何规则
+        self.assertEqual(dialog.force_devices(), [])
+        self.assertEqual(dialog.block_devices(), [])
+
+    def test_hyperv_only_setup_is_prechecked_via_fallback(self):
+        dialog = self._dialog(self._records()[1:2], {})
+        self.assertTrue(dialog._rows[0][1].isChecked())
+        self.assertEqual(dialog.force_devices(), [])
+        self.assertEqual(dialog.block_devices(), [])
+
+    def test_unchecking_a_physical_adapter_blocks_it(self):
+        dialog = self._dialog(self._records()[:1] + self._records()[2:], {})
+        dialog._rows[0][1].setChecked(False)
+
+        self.assertEqual(dialog.block_devices(), ["以太网"])
+        self.assertEqual(dialog.force_devices(), [])
+
+    def test_checking_a_virtual_adapter_forces_it(self):
+        dialog = self._dialog(self._records()[:1] + self._records()[2:], {})
+        dialog._rows[1][1].setChecked(True)
+
+        self.assertEqual(dialog.force_devices(), ["VMware Network Adapter VMnet1"])
+        self.assertEqual(dialog.block_devices(), [])
+
+    def test_existing_rules_are_reflected_and_round_trip(self):
+        dialog = self._dialog(self._records()[:1] + self._records()[2:],
+                              {"scan_force_devices": ["vmware"]})
+        self.assertEqual(
+            self._checked(dialog), {"以太网": True, "VMware Network Adapter VMnet1": True}
+        )
+        self.assertEqual(dialog.force_devices(), ["VMware Network Adapter VMnet1"])
+        self.assertEqual(dialog.block_devices(), [])
+
+    def test_blocked_adapter_opens_unchecked_and_round_trips(self):
+        dialog = self._dialog(self._records()[:1], {"scan_block_devices": ["以太网"]})
+        self.assertFalse(dialog._rows[0][1].isChecked())
+        self.assertEqual(dialog.block_devices(), ["以太网"])
+        self.assertEqual(dialog.force_devices(), [])
+
+    def test_state_label_follows_the_checkbox(self):
+        dialog = self._dialog(self._records()[:1], {})
+        _record, box, state = dialog._rows[0]
+
+        box.setChecked(False)
+        self.assertEqual(state.text(), "不会扫描")
+        box.setChecked(True)
+        self.assertEqual(state.text(), "将参与扫描")
+
+    def test_empty_enumeration_keeps_existing_rules(self):
+        dialog = self._dialog([], {"scan_force_devices": ["vEthernet"],
+                                   "scan_block_devices": ["以太网"]})
+        self.assertEqual(dialog.force_devices(), ["vEthernet"])
+        self.assertEqual(dialog.block_devices(), ["以太网"])
+
+    def test_force_subnets_splits_both_comma_styles_and_dedupes(self):
+        dialog = self._dialog([], {"scan_force_subnets": ["10.0.0.0/8"]})
+
+        self.assertEqual(dialog.subnetEdit.text(), "10.0.0.0/8")
+        dialog.subnetEdit.setText("192.168.1.0/24，10.0.0.0/8, 192.168.1.0/24 ,")
+        self.assertEqual(dialog.force_subnets(), ["192.168.1.0/24", "10.0.0.0/8"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

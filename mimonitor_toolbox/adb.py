@@ -15,6 +15,7 @@ from .core import (
     get_colorful_led_tool_path,
     get_mtk_direct_tool_path,
     is_frozen_build,
+    load_settings,
 )
 from .network_scan import (
     WindowsAdapterError,
@@ -522,7 +523,13 @@ def scan_adb(cb=None, log=None, cancel_event=None):
     """扫描全部有效物理网卡，并通过临时 ADB 连接读取设备型号。"""
 
     cancel_event = cancel_event or threading.Event()
-    networks = get_windows_scan_networks(log=log)
+    settings = load_settings()
+    networks = get_windows_scan_networks(
+        log=log,
+        force_devices=settings.get("scan_force_devices") or (),
+        force_subnets=settings.get("scan_force_subnets") or (),
+        block_devices=settings.get("scan_block_devices") or (),
+    )
     if not networks:
         raise WindowsAdapterError("未找到可扫描的物理网卡")
     targets = build_probe_targets(networks, log=log)

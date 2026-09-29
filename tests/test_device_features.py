@@ -1302,5 +1302,40 @@ class WindowsResumeReconnectTests(unittest.TestCase):
         self.assertFalse(any("测试操作失败" in message for message in host.logs))
 
 
+class NetworkSignatureTests(unittest.TestCase):
+    """网络变化检测（_network_signature）要和扫描同一口径。"""
+
+    def test_hyperv_switch_adapter_counts_as_a_network(self):
+        import ipaddress
+
+        from mimonitor_toolbox import device_features
+        from mimonitor_toolbox.network_scan import RawAdapterAddress
+
+        host = device_features.DeviceFeaturesMixin()
+        host.log = lambda message: None
+        record = RawAdapterAddress(
+            interface_index=2,
+            interface_name="vEthernet (External)",
+            local_ip=ipaddress.IPv4Address("192.168.1.5"),
+            prefix_length=24,
+            metric=25,
+            if_type=6,
+            oper_status=1,
+            hardware_interface=False,
+            adapter_description="Hyper-V Virtual Ethernet Adapter",
+            endpoint_interface=True,
+        )
+
+        with mock.patch.object(device_features, "enumerate_windows_adapter_addresses",
+                               return_value=[record]), \
+                mock.patch.object(device_features, "load_settings",
+                                  return_value={"scan_force_devices": [],
+                                                "scan_force_subnets": []}):
+            signature = host._network_signature()
+
+        self.assertEqual(len(signature), 1)
+        self.assertEqual(signature[0][1], "vEthernet (External)")
+
+
 if __name__ == "__main__":
     unittest.main()

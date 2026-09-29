@@ -54,6 +54,12 @@ def _load_settings_unlocked():
         "close_behavior": "tray",
         "never_ask_close": False,
         "saved_ip": "",
+        # 扫描网卡的高级覆盖：Hyper-V 外部虚拟交换机把物理网卡的 IP 搬到了
+        # vEthernet 上（物理网卡会"非物理网卡"式地被过滤掉），这两项可以点名
+        # 某块网卡 / 某个网段永远参与扫描。
+        "scan_force_devices": [],
+        "scan_block_devices": [],
+        "scan_force_subnets": [],
         "hdr_sdr_local_dimming_enabled": False,
         "hdr_target_display_id": "",
         "local_dimming_memory": {"sdr": None, "hdr": None},

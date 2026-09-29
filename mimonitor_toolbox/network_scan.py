@@ -26,6 +26,8 @@ GAA_FLAG_SKIP_MULTICAST = 0x0004
 GAA_FLAG_SKIP_DNS_SERVER = 0x0008
 GAA_FLAG_INCLUDE_PREFIX = 0x0010
 IP_ADAPTER_IPV4_ENABLED = 0x0080
+HYPERV_ADAPTER_DESCRIPTION = "hyper-v virtual ethernet"
+HYPERV_FRIENDLY_PREFIX = "vethernet"
 MAX_ADAPTER_ADDRESS_LENGTH = 8
 IF_MAX_STRING_SIZE = 256
 IF_MAX_PHYS_ADDRESS_LENGTH = 32
@@ -226,6 +228,7 @@ class RawAdapterAddress:
     if_type: int
     oper_status: int
     hardware_interface: bool
+    adapter_description: str = ""
     filter_interface: bool = False
     media_connected: bool = True
     endpoint_interface: bool = False
@@ -268,35 +271,155 @@ def _is_rfc1918(ip: ipaddress.IPv4Address) -> bool:
     return any(ip in network for network in _RFC1918_NETWORKS)
 
 
-def select_scan_networks(
-    records: Iterable[RawAdapterAddress],
-    log: Optional[Callable[[str], None]] = None,
-) -> list[ScanNetwork]:
-    """筛选可扫描的物理网卡，并对相同有效网段按 metric 去重。"""
+def is_hyperv_switch_adapter(record: RawAdapterAddress) -> bool:
+    """是不是 Hyper-V 虚拟交换机的主机网卡（``vEthernet (...)``）。
 
+    建了**外部**虚拟交换机之后，物理网卡的 TCP/IP 会被解绑（没有地址），IP 跑到这块
+    虚拟网卡上 —— 它虽然不是"物理网卡"，却是唯一真正连着局域网的那块。
+    """
+    description = str(getattr(record, "adapter_description", "") or "").strip().lower()
+    if HYPERV_ADAPTER_DESCRIPTION in description:
+        return True
+    return (record.interface_name or "").strip().lower().startswith(HYPERV_FRIENDLY_PREFIX)
+
+
+def is_scan_adapter(
+    record: RawAdapterAddress,
+    force_devices: Iterable[str] = (),
+    force_subnets: Iterable[ipaddress.IPv4Network] = (),
+    block_devices: Iterable[str] = (),
+) -> bool:
+    """这块网卡算不算"我们要关心的那张网卡"（不看当下是否 up、有没有地址）。
+
+    `_network_signature` 之类只关心"哪些网卡参与"的地方复用它，保证和扫描同一口径。
+    """
+    if adapter_is_blocked(record, block_devices):
+        return False
+    if adapter_force_reason(record, force_devices, force_subnets):
+        return True
+    # 扫描在"一个物理网卡都选不出来"时会回退使用虚拟网卡，所以这里也把虚拟网卡
+    # 算进来 —— 否则外部交换机场景下"网络变化检测"会以为一直没有网络
+    return (
+        not record.filter_interface
+        and record.if_type in (IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211)
+    )
+
+
+def adapter_matches_device_rule(
+    record: RawAdapterAddress,
+    force_devices: Iterable[str] = (),
+) -> Optional[str]:
+    """网卡是否命中"按网卡"强制规则：接口索引相等，或名字/型号包含该子串。
+
+    扫描和设置弹窗都用这一个判定，避免"弹窗里勾选状态"和"扫描实际行为"不一致。
+    """
+    tokens = [str(item).strip().lower() for item in force_devices or () if str(item).strip()]
+    if not tokens:
+        return None
+    haystack = " ".join(
+        (str(record.interface_name or ""),
+         str(getattr(record, "adapter_description", "") or ""))
+    ).lower()
+    for token in tokens:
+        if token == str(record.interface_index) or token in haystack:
+            return token
+    return None
+
+
+def adapter_is_blocked(
+    record: RawAdapterAddress,
+    block_devices: Iterable[str] = (),
+) -> bool:
+    """网卡是否在"扫描设置"里被取消勾选（一律不扫描）。"""
+    return adapter_matches_device_rule(record, block_devices) is not None
+
+
+def adapter_force_reason(
+    record: RawAdapterAddress,
+    force_devices: Iterable[str] = (),
+    force_subnets: Iterable[ipaddress.IPv4Network] = (),
+) -> Optional[str]:
+    """命中设置里的强制规则时返回原因，否则 None（用于日志）。"""
+    device_hit = adapter_matches_device_rule(record, force_devices)
+    if device_hit:
+        return f"按网卡强制（{device_hit}）"
+    for subnet in force_subnets or ():
+        if record.local_ip in subnet:
+            return f"按网段强制（{subnet}）"
+    return None
+
+
+def parse_force_subnets(
+    values: Iterable[str],
+    log: Optional[Callable[[str], None]] = None,
+) -> tuple[ipaddress.IPv4Network, ...]:
+    """解析设置里的强制网段，坏值只记日志不抛。"""
+    parsed: list[ipaddress.IPv4Network] = []
+    for value in values or ():
+        text = str(value).strip()
+        if not text:
+            continue
+        try:
+            parsed.append(ipaddress.IPv4Network(text, strict=False))
+        except ValueError:
+            _log(log, f"[扫描] 设置里的强制网段无法解析，已忽略: {text!r}")
+    return tuple(parsed)
+
+
+def _rejection_reason(
+    record: RawAdapterAddress,
+    forced: Optional[str],
+    bypass_physical: bool,
+    blocked: bool = False,
+) -> Optional[str]:
+    if blocked:
+        return "已在扫描设置里取消勾选"
+    if record.oper_status != IF_OPER_STATUS_UP:
+        return "网卡未启用"
+    if not record.media_connected:
+        return "网络未连接"
+    if not forced:
+        # 接口类型是"能不能扫"的硬条件，自动回退也不放开（隧道网卡不在局域网里）
+        if record.if_type not in (IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211):
+            return f"接口类型不支持({record.if_type})"
+    if not (forced or bypass_physical):
+        if not record.hardware_interface:
+            return "非物理网卡（虚拟网卡可在设置里强制指定）"
+        if record.filter_interface:
+            return "过滤器接口"
+        if record.endpoint_interface:
+            return "终端接口"
+    # 自动回退不算用户显式指定，仍然只认私网地址：别把公网网段扫了
+    if not forced and not _is_rfc1918(record.local_ip):
+        return "非 RFC1918 IPv4"
+    if not 1 <= record.prefix_length <= 30:
+        return f"前缀长度不支持(/{record.prefix_length})"
+    return None
+
+
+def _collect_networks(
+    records: Iterable[RawAdapterAddress],
+    log: Optional[Callable[[str], None]],
+    force_devices: Iterable[str],
+    force_subnets: Iterable[ipaddress.IPv4Network],
+    bypass_physical: bool,
+    block_devices: Iterable[str] = (),
+) -> dict[ipaddress.IPv4Network, ScanNetwork]:
     selected: dict[ipaddress.IPv4Network, ScanNetwork] = {}
     for record in records:
-        reason = None
-        if record.oper_status != IF_OPER_STATUS_UP:
-            reason = "网卡未启用"
-        elif not record.hardware_interface:
-            reason = "非物理网卡"
-        elif record.filter_interface:
-            reason = "过滤器接口"
-        elif not record.media_connected:
-            reason = "网络未连接"
-        elif record.endpoint_interface:
-            reason = "终端接口"
-        elif record.if_type not in (IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211):
-            reason = f"接口类型不支持({record.if_type})"
-        elif not _is_rfc1918(record.local_ip):
-            reason = "非 RFC1918 IPv4"
-        elif not 1 <= record.prefix_length <= 30:
-            reason = f"前缀长度不支持(/{record.prefix_length})"
-
+        blocked = adapter_is_blocked(record, block_devices)
+        forced = None if blocked or bypass_physical else adapter_force_reason(
+            record, force_devices, force_subnets
+        )
+        reason = _rejection_reason(record, forced, bypass_physical, blocked)
         if reason:
             _log(log, f"[扫描] 跳过网卡 {record.interface_name} {record.local_ip}: {reason}")
             continue
+        if forced:
+            _log(
+                log,
+                f"[扫描] 网卡 {record.interface_name} {record.local_ip} 参与扫描：{forced}",
+            )
 
         original = ipaddress.IPv4Network(
             (record.local_ip, record.prefix_length), strict=False
@@ -325,6 +448,66 @@ def select_scan_networks(
             int(current.local_ip),
         ):
             selected[effective] = candidate
+    return selected
+
+
+def select_scan_networks(
+    records: Iterable[RawAdapterAddress],
+    log: Optional[Callable[[str], None]] = None,
+    force_devices: Iterable[str] = (),
+    force_subnets: Iterable[str] = (),
+    block_devices: Iterable[str] = (),
+) -> list[ScanNetwork]:
+    """筛选可扫描的网卡，并按有效网段去重。
+
+    默认只认物理网卡。但**建了 Hyper-V 外部虚拟交换机之后**，物理网卡的 TCP/IP 会被
+    解绑（它没有地址了），IP 跑到 ``vEthernet (...)`` 上 —— 正常筛选会一个网段都选不
+    出来。所以当一份物理网卡都选不出来时，回退使用**剩下的合规虚拟网卡**
+    （不限定 Hyper-V：VMware/VirtualBox/WSL 同理）。
+
+    设置里有三个覆盖项（「扫描设置」弹窗写的就是它们）：
+
+    * ``scan_force_devices``：勾选的网卡（名字子串或接口索引）始终参与
+    * ``scan_block_devices``：取消勾选的网卡一律不参与（优先于强制）
+    * ``scan_force_subnets``：CIDR，网卡地址落在里面就参与
+    """
+
+    record_list = list(records)
+    subnets = parse_force_subnets(force_subnets, log=log)
+    selected = _collect_networks(
+        record_list, log, force_devices, subnets, bypass_physical=False,
+        block_devices=block_devices,
+    )
+    # 用户对"当前这些网卡"显式表过态（在扫描设置里勾了或取消了某块）时，不再自动
+    # 回退：否则"取消勾选"会被回退机制绕过，去扫一块用户没要的虚拟网卡。
+    has_explicit_device_rule = any(
+        adapter_is_blocked(item, block_devices)
+        or adapter_matches_device_rule(item, force_devices)
+        for item in record_list
+    )
+    if not selected and not has_explicit_device_rule:
+        # 回退条件刻意不看网卡名字/型号：Hyper-V 外部交换机只是最常见的一种
+        # （IP 被搬到虚拟网卡上、物理网卡反而没有地址），VMware/VirtualBox/WSL
+        # 等虚拟网卡在"没有物理网卡"时同样是唯一可用的那张。
+        # 判据 = "除了不是物理网卡之外，其它条件都合规"。
+        fallback = [
+            item for item in record_list
+            if _rejection_reason(
+                item, None, bypass_physical=True,
+                blocked=adapter_is_blocked(item, block_devices),
+            ) is None
+        ]
+        if fallback:
+            hyperv_count = sum(1 for item in fallback if is_hyperv_switch_adapter(item))
+            _log(
+                log,
+                f"[扫描] 没有选出物理网卡；回退使用 {len(fallback)} 块虚拟网卡"
+                f"（其中 Hyper-V 交换机 {hyperv_count} 块）",
+            )
+            selected = _collect_networks(
+                fallback, log, force_devices, subnets, bypass_physical=True,
+                block_devices=block_devices,
+            )
 
     networks = sorted(
         selected.values(),
@@ -428,6 +611,7 @@ def enumerate_windows_adapter_addresses() -> list[RawAdapterAddress]:
                             if_type=int(adapter.IfType),
                             oper_status=int(adapter.OperStatus),
                             hardware_interface=hardware_interface,
+                            adapter_description=str(adapter.Description or ""),
                             filter_interface=filter_interface,
                             media_connected=media_connected,
                             endpoint_interface=endpoint_interface,
@@ -441,11 +625,20 @@ def enumerate_windows_adapter_addresses() -> list[RawAdapterAddress]:
 def get_windows_scan_networks(
     log: Optional[Callable[[str], None]] = None,
     adapter_provider: Optional[Callable[[], list[RawAdapterAddress]]] = None,
+    force_devices: Iterable[str] = (),
+    force_subnets: Iterable[str] = (),
+    block_devices: Iterable[str] = (),
 ) -> list[ScanNetwork]:
-    """枚举并筛选所有适合扫描的 Windows 物理局域网。"""
+    """枚举并筛选所有适合扫描的 Windows 局域网（含设置里的强制/排除规则）。"""
 
     provider = adapter_provider or enumerate_windows_adapter_addresses
-    return select_scan_networks(provider(), log=log)
+    return select_scan_networks(
+        provider(),
+        log=log,
+        force_devices=force_devices,
+        force_subnets=force_subnets,
+        block_devices=block_devices,
+    )
 
 
 def build_probe_targets(

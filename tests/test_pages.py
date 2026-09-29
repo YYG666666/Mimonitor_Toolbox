@@ -1,5 +1,6 @@
 import os
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import _isolation  # noqa: F401  配置隔离：见 tests/_isolation.py
@@ -356,6 +357,63 @@ class CountdownSettingsUiTests(TrayTestBase):
         滑杆下限 0.2 天然满足，这里守住别把它放开。"""
         self.window.countdown_seconds_slider.setValue(1)
         self.assertEqual(self.window.countdown_seconds_slider.value(), 2)
+
+    def test_scan_settings_dialog_saves_selection(self):
+        from mimonitor_toolbox import pages as pages_module
+
+        window = self.window
+        settings = {"scan_force_devices": [], "scan_block_devices": [],
+                    "scan_force_subnets": []}
+        fake_dialog = mock.MagicMock()
+        fake_dialog.exec.return_value = True
+        fake_dialog.force_devices.return_value = ["vEthernet (External)"]
+        fake_dialog.block_devices.return_value = ["以太网"]
+        fake_dialog.force_subnets.return_value = ["192.168.1.0/24"]
+
+        with mock.patch.object(pages_module, "enumerate_windows_adapter_addresses",
+                               return_value=[]), \
+                mock.patch.object(pages_module, "ScanSettingsDialog",
+                                  return_value=fake_dialog) as dialog_cls, \
+                mock.patch.object(pages_module, "update_settings",
+                                  side_effect=settings.update):
+            window._open_scan_settings()
+
+        self.assertEqual(settings["scan_force_devices"], ["vEthernet (External)"])
+        self.assertEqual(settings["scan_block_devices"], ["以太网"])
+        self.assertEqual(settings["scan_force_subnets"], ["192.168.1.0/24"])
+        dialog_cls.assert_called_once()
+
+    def test_scan_settings_dialog_is_opened_with_the_enumerated_adapters(self):
+        from mimonitor_toolbox import pages as pages_module
+
+        record = SimpleNamespace(interface_name="vEthernet (External)")
+        fake_dialog = mock.MagicMock()
+        fake_dialog.exec.return_value = False
+
+        with mock.patch.object(pages_module, "enumerate_windows_adapter_addresses",
+                               return_value=[record]), \
+                mock.patch.object(pages_module, "ScanSettingsDialog",
+                                  return_value=fake_dialog) as dialog_cls, \
+                mock.patch.object(pages_module, "update_settings") as update:
+            self.window._open_scan_settings()
+
+        self.assertEqual(dialog_cls.call_args[0][0], [record])
+        # 取消不该写设置
+        update.assert_not_called()
+
+    def test_scan_settings_still_opens_when_enumeration_fails(self):
+        from mimonitor_toolbox import pages as pages_module
+
+        fake_dialog = mock.MagicMock()
+        fake_dialog.exec.return_value = False
+
+        with mock.patch.object(pages_module, "enumerate_windows_adapter_addresses",
+                               side_effect=RuntimeError("boom")), \
+                mock.patch.object(pages_module, "ScanSettingsDialog",
+                                  return_value=fake_dialog) as dialog_cls:
+            self.window._open_scan_settings()
+
+        self.assertEqual(dialog_cls.call_args[0][0], [])
 
     def test_hdr_source_and_memory_options_have_plain_labels(self):
         window = self.window

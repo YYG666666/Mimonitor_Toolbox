@@ -58,6 +58,7 @@ from .core import (
     load_settings,
     update_settings,
 )
+from .network_scan import enumerate_windows_adapter_addresses
 from .presets import BASELINE_PRESET_ID, find_preset, new_id, unique_name
 from .windows import list_windows_displays
 from .widgets import (
@@ -70,6 +71,7 @@ from .widgets import (
     PresetCard,
     PresetNameDialog,
     RefreshableComboBox,
+    ScanSettingsDialog,
     TrayItemList,
 )
 
@@ -179,6 +181,13 @@ class PagesMixin:
         self.disconnect_btn = PushButton(FIF.CLOSE, "断开连接", conn_card)
         self.disconnect_btn.clicked.connect(self.disconnect_adb)
         row1.addWidget(self.disconnect_btn)
+
+        self.scan_settings_btn = PushButton(FIF.SETTING, "扫描设置", conn_card)
+        self.scan_settings_btn.setToolTip(
+            "点名哪些网卡/网段始终参与扫描。创建 Hyper-V 外部虚拟交换机后，IP 会跑到 "
+            "vEthernet 上，程序会自动回退用它；这里是给自动没覆盖到的情况兜底。")
+        self.scan_settings_btn.clicked.connect(self._open_scan_settings)
+        row1.addWidget(self.scan_settings_btn)
         row1.addStretch(1)
         conn_layout.addLayout(row1)
 
@@ -875,6 +884,31 @@ class PagesMixin:
                       for i in range(combo.count())), default=0)
         combo.setFixedWidth(min(420, max(300, widest + 48)))
 
+    def _open_scan_settings(self):
+        """打开「扫描设置」：勾选强制参与扫描的网卡 + 手输强制网段。"""
+        try:
+            records = enumerate_windows_adapter_addresses()
+        except Exception as error:
+            # 非 Windows / 枚举失败：仍然允许手输网段
+            records = []
+            self.log(f"读取网卡列表失败，只能手输网段：{error}")
+        dialog = ScanSettingsDialog(records, load_settings(), self)
+        accepted = dialog.exec()
+        if accepted:
+            devices = dialog.force_devices()
+            blocked = dialog.block_devices()
+            subnets = dialog.force_subnets()
+            update_settings({
+                "scan_force_devices": devices,
+                "scan_block_devices": blocked,
+                "scan_force_subnets": subnets,
+            })
+            self.log(
+                f"扫描设置已保存：强制网卡={devices or '无'}，不扫描网卡={blocked or '无'}，"
+                f"强制网段={subnets or '无'}"
+            )
+        dialog.deleteLater()
+
     def _preset_apply(self, preset_id):
         self.apply_preset_by_id(preset_id)
         # 应用后状态落盘，卡片上的「已应用」和画面页提示都要跟着变
@@ -1431,6 +1465,7 @@ class PagesMixin:
         self.crosshair_mode_status_label.setTextColor(QColor(120, 120, 120), QColor(255, 255, 255, 140))
         c3_lay.addWidget(self.crosshair_mode_status_label)
         self._update_crosshair_mode_status_label()
+
 
         grid.addWidget(card3, 2, 0, 1, 2)
 

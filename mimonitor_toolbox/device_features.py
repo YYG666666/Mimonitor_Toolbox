@@ -39,11 +39,11 @@ from .core import (
     update_settings,
 )
 from .network_scan import (
-    IF_TYPE_ETHERNET_CSMACD,
-    IF_TYPE_IEEE80211,
     WindowsAdapterError,
     enumerate_windows_adapter_addresses,
+    is_scan_adapter,
     is_tcp_endpoint_open,
+    parse_force_subnets,
 )
 from .presets import (
     PICTURE_PRESET_JNI_KEYS,
@@ -295,6 +295,12 @@ class DeviceFeaturesMixin:
         except Exception as exc:
             self.log(f"读取 Windows 网卡状态失败: {exc}")
             return None
+        # 与扫描同一口径：包含 Hyper-V 虚拟交换机网卡和设置里的强制网卡/网段，
+        # 否则外部交换机场景下"网络变化检测"会以为一直没有网络
+        settings = load_settings()
+        force_devices = settings.get("scan_force_devices") or ()
+        block_devices = settings.get("scan_block_devices") or ()
+        force_subnets = parse_force_subnets(settings.get("scan_force_subnets") or ())
         signature = [
             (
                 record.interface_index,
@@ -307,10 +313,7 @@ class DeviceFeaturesMixin:
                 record.media_connected,
             )
             for record in records
-            if record.hardware_interface
-            and not record.filter_interface
-            and not record.endpoint_interface
-            and record.if_type in (IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211)
+            if is_scan_adapter(record, force_devices, force_subnets, block_devices)
         ]
         return tuple(sorted(signature))
 
