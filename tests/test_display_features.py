@@ -1267,6 +1267,10 @@ class MemorySuspensionUnderPresetTests(unittest.TestCase):
                 self.current_vals = {}
                 self.saved = []
                 self.applied = []
+                # 固定 HDR 状态来源：本类只测"记忆要不要落桶"的逻辑，不该去碰真实
+                # DXGI/显示器枚举 —— 那样会在没接显示器的机器上（含 Linux）失败，
+                # 而 _query_windows_hdr_state 现在依赖已解析好的目标屏，裸 mixin 没有。
+                self._hdr_last_state = False
 
             def _hdr_memory_enabled(self):
                 return True
